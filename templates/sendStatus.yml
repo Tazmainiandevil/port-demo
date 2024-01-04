@@ -1,0 +1,20 @@
+parameters:
+- name: Status
+  type: string
+  default: 'FAILURE'
+- name: Message
+  type: string
+  default: "Azure Resource Creation Successful"
+- name: RunId
+  type: string
+- name: AccessToken
+  type: string
+steps:
+- bash: |
+    curl -X PATCH \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer ${{ parameters.AccessToken }}" \
+      -d '{"status":"${{ parameters.Status }}", "message": {"run_status": "${{ parameters.Message }}"}}' \
+      "https://api.getport.io/v1/actions/runs/${{ parameters.RunId }}"
+  displayName: 'Send Status'
+  condition: always()

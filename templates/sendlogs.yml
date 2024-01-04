@@ -1,0 +1,23 @@
+parameters:
+- name: Message
+  type: object  
+- name: RunId
+  type: string
+- name: AccessToken
+  type: string
+- name: conditionLevel
+  type: object
+  default: always()
+  values:
+   - always()
+   - succeeded()
+   - failed()
+steps:
+- bash: |
+    curl -X POST \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer ${{ parameters.AccessToken }}" \
+      -d '{"message": "${{ parameters.Message }}"}' \
+      "https://api.getport.io/v1/actions/runs/${{ parameters.RunId }}/logs"
+  displayName: Send Logs  
+  condition: and(${{ parameters.conditionLevel }}, ne('${{ parameters.Message }}', ''))

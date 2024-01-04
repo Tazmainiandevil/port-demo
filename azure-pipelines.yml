@@ -1,0 +1,170 @@
+trigger: none
+pr: none
+
+resources:
+  webhooks:
+    - webhook: incomingport
+      connection: Port.io
+
+variables:
+  subscription: 'Twisters Portal'
+  System.debug: true
+  runId: ${{ parameters.incomingport.context.runId }}
+  deployParametersFileName: 'deploy.bicepparam'
+  deployFileName: deploy_${{ lower(replace(parameters.incomingport.action,'create_', '')) }}.bicep
+  deployStatus: "FAILURE"
+  deployStatusMessage: "Azure Resource Creation Failed"
+  deployMessage: "Deployment Pipeline Failed"
+
+stages:
+  - stage: run_resource_creation
+    displayName: 'Run Resource Creation'
+    jobs:
+    - job: fetch_port_access_token
+      displayName: 'Create Resources'
+      pool:
+            vmImage: 'ubuntu-latest'
+      steps:
+        - script: |
+            accessToken=$(curl -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"clientId": "$(PORT_CLIENT_ID)", "clientSecret": "$(PORT_CLIENT_SECRET)"}' \
+            -s 'https://api.getport.io/v1/auth/access_token' | jq -r '.accessToken')
+            echo "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
+            echo "runId=$(runId)"
+          displayName: Fetch Access Token and Run ID
+          name: getToken
+        - template: templates/sendlogs.yml
+          parameters:
+            Message: "Create parameters file"
+            AccessToken: $(accessToken)
+            RunId: $(runId)
+            conditionLevel: succeeded()
+        - pwsh: |
+            $obj = $env:payload | ConvertFrom-Json -AsHashtable
+            $additionalObj = $env:entityPayload ?? @() | ConvertFrom-Json -AsHashtable
+            $excludeList = @()
+            $filename = "$env:deployParametersFileName"
+
+            Out-File -FilePath $filename
+            "using '$(deployFileName)'" | Out-File -FilePath $filename -Append
+            "param runId = '$env:runId'" | Out-File -FilePath $filename -Append
+            # Payload Properties
+            ($obj.Keys | ForEach-Object { 
+              if ($_ -notin $excludeList) { 
+                if($($obj[$_]).GetType().Name -eq "String") {
+                  "param $_ = '$($obj[$_])'"
+                } 
+                else {
+                  "param $_ = $($obj[$_])"
+                }
+              }
+            }) | Out-File -FilePath $filename -Append
+            # Entity Payload Properties
+            if($additionalObj.count -ne 0) {
+              $entityExcludeList = @("iac","provider","appname")
+              ($additionalObj.Keys | ForEach-Object {
+                  if ($_ -notin $entityExcludeList) {
+                    if($($additionalObj[$_]).GetType().Name -eq "String") {
+                      "param $_ = '$($additionalObj[$_])'"
+                    } 
+                    else {
+                      "param $_ = $($additionalObj[$_])"
+                    }
+                  }
+                }) | Out-File -FilePath $filename -Append
+                if($env:entityIdentifier -ne $null) {
+                  "param parentName = '$env:entityIdentifier'" | Out-File -FilePath $filename -Append
+                }
+            }
+          displayName: 'Create Parameters File'
+          env:
+            runId: $(runId)
+            payload: ${{ convertToJson(parameters.incomingport.payload.properties) }}
+            entityPayload: ${{ convertToJson(parameters.incomingport.payload.entity.properties) }}
+            entityIdentifier: ${{ parameters.incomingport.payload.entity.identifier }}
+            deployParametersFileName: $(deployParametersFileName)
+        - bash: |
+            cat $(deployParametersFileName)
+          displayName: 'Show File'
+          condition: and(succeeded(), eq(variables['System.debug'], 'true'))
+        - template: templates/sendlogs.yml
+          parameters:
+            Message: "Deploying Resources"
+            AccessToken: $(accessToken)
+            RunId: $(runId)
+            conditionLevel: succeeded()
+        - task: AzureCLI@2
+          displayName: "Deploy Resources"
+          inputs:
+            azureSubscription: $(subscription)
+            scriptType: "pscore"
+            scriptLocation: "inlineScript"
+            inlineScript: |
+              $outputStatus = "SUCCESS"
+              $outputStatusMessage = "Azure Resource Creation Succeeded"
+              $resourceGroupName = "$env:environment-$env:appname-rg"
+              $deploymentName = "deploy_$env:runId"
+              if($(az group exists --name $resourceGroupName) -eq $false) {
+                az group create --name $resourceGroupName --location $env:location
+              }
+              $output = $(az deployment group create --resource-group $resourceGroupName --template-file $env:deployFileName --parameters $env:deployParametersFileName --name $deploymentName 2>&1)
+              if (!$?) {
+                $outputStatus = "FAILURE"
+                $outputStatusMessage = "Azure Resource Creation Failed"
+                try {
+                  $obj = $output.Exception.Message -replace '["()]', '\$&'
+                  $output = $obj
+                } catch {
+                  $output = "Something went wrong"
+                }
+              } else {
+                $output = $output -replace '["()]', '\$&'
+              }
+              $title = (Get-Culture).TextInfo.ToTitleCase($env:deployTitle)
+
+              $resourceName = $(az deployment group show -g $resourceGroupName -n $deploymentName --query properties.outputs.resourceName.value -o tsv)
+              Write-Host "##vso[task.setvariable variable=resourceName;]$resourceName"
+              Write-Host "##vso[task.setvariable variable=deployMessage;]$output"
+              Write-Host "##vso[task.setvariable variable=deployStatus;]$outputStatus"
+              Write-Host "##vso[task.setvariable variable=deployStatusMessage;]$outputStatusMessage"
+              Write-Host "##vso[task.setvariable variable=deployTitle;]$title"
+          env:
+            runId: $(runId)
+            location: ${{ parameters.incomingport.payload.properties.location }}
+            environment: ${{ coalesce(parameters.incomingport.payload.properties.environment, parameters.incomingport.payload.entity.properties.environment) }}
+            appname: ${{ coalesce(parameters.incomingport.payload.properties.appname, parameters.incomingport.payload.entity.properties.appname) }}
+            deployFileName: $(deployFileName)
+            deployParametersFileName: $(deployParametersFileName)
+            deployTitle: ${{ lower(replace(replace(parameters.incomingport.action,'create_', ''),'_',' ')) }}
+        - script: |
+            echo '$(resourceName)'
+          displayName: 'Show Outputs'
+        - script: |
+            curl -X POST \
+              -H 'Content-Type: application/json' \
+              -H "Authorization: Bearer $(accessToken)" \
+              -d '{
+                    "identifier": "$(resourceName)",
+                    "title": "$(deployTitle)",
+                    "properties": {"environment": "${{ parameters.incomingport.payload.properties.environment }}","iac": "Bicep","appname": "${{ coalesce(parameters.incomingport.payload.properties.appname, parameters.incomingport.payload.properties.name) }}"},
+                    "relations": {"cloud_host": "${{ parameters.incomingport.payload.properties.location }}"}
+                  }' \
+              "https://api.getport.io/v1/blueprints/${{ parameters.incomingport.context.blueprint }}/entities?upsert=true&run_id=$(runId)&create_missing_related_entities=true"
+          displayName: 'Upsert entity'
+        - template: templates/sendlogs.yml
+          parameters:
+            Message: $(deployMessage)
+            AccessToken: $(accessToken)
+            RunId: $(runId)
+        - template: templates/sendlogs.yml
+          parameters:
+            Message: "Deployment Finished"
+            AccessToken: $(accessToken)
+            RunId: $(runId)
+        - template: templates/sendStatus.yml
+          parameters:
+            Status: $(deployStatus)
+            Message: $(deployStatusMessage)
+            AccessToken: $(accessToken)
+            RunId: $(runId)
